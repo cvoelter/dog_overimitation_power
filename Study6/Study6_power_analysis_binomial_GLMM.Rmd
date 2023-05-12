@@ -1,0 +1,240 @@
+---
+title: "Study 5 - Puppy - binomial GLMM - power simulation"
+author: "Christoph Völter"
+date: "09/05/2023"
+output: 
+  html_document:
+    theme: united
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls(all.names = TRUE))
+library(tidyverse)
+library(cowplot)
+library("gghalves")
+
+#load(".RData")
+```
+
+## Generate data
+
+```{r echo=FALSE, include=FALSE}
+set.seed(1)
+n.subject <- 80 # number subjects
+n.per.subject <- 4 # observations per subject
+n.per.condition <- 4 # observations per subject and condition
+n.groups <-2
+subj.id <- as.factor(paste("subj", str_pad(1:n.subject, 2, pad = "0"), sep = "."))
+
+age_range <- c(12:130) # age range between 1 and 13 years
+con.per <- c(0.58) # performance in pack dog group
+test.per <- c(0.3, 0.25) # performance in wolf group
+
+
+# add condition and trial number
+start.data <- expand.grid(trial=c(1:4), condition = c("con", "test"))
+# Repeat All Rows
+rows= c(1:nrow(start.data))
+times = n.subject/n.groups
+start.data<-start.data[rep(rows, times),]
+start.data$subj.id<-rep(subj.id, each=n.per.condition)
+start.data$sex<-rep(rep(c("m", "f"), each=n.per.condition*n.groups), n.subject)[1:nrow(start.data)]
+
+table(start.data$condition, start.data$sex)
+
+          
+# z-transformation of covariates
+start.data$z.trial <- as.vector(scale(as.numeric(start.data$trial)))
+
+# relevel condition
+start.data$condition <- relevel(as.factor(start.data$condition), "con", "test")
+levels(start.data$condition)
+# checks:
+# does each subject have only one sex and age?
+xx <- table(start.data$subj.id, start.data$sex)
+range(apply(X = xx > 0, MARGIN = 1, sum)) # should be 1 and 1
+
+xx <- table(start.data$subj.id, start.data$condition)
+range(apply(X = xx > 0, MARGIN = 1, sum))
+
+xx <- table(start.data$subj.id, start.data$trial)
+range(apply(X = xx > 0, MARGIN = 1, sum))
+
+```
+
+## Simulation
+
+```{r eval=FALSE, include=FALSE}
+n.simus <- 1000 # small number for testing
+r.effects <- c(0.5) # random effects to be simulated
+# with the intercept being 0.32 (qlogis(0.58)) we could make the following
+# guesses for the random intercept:
+#- 0.4: moderate random intercepts effect
+
+r.slope.trial <- 0.2
+
+
+# create object to store the simulation parameters and results:
+all.res <- data.frame(expand.grid(
+  n.per.subject = n.per.subject, r.effect = r.effects, 
+  r.slope.trial = r.slope.trial,   
+  con.per =  con.per,
+  test.per =  test.per,
+  simu = 1:n.simus
+))
+all.res$icpt <- NA
+all.res$conditiontest <- NA
+all.res$re.sd <- NA
+all.res$warns.full <- NA
+all.res$warns.null <- NA
+all.res$lrt.p.con <- NA
+all.res$full.null.p <- NA
+all.res$conditiontest.p <- NA
+
+
+
+all.ests=matrix(NA, nrow=n.simus, ncol=1)
+colnames(all.ests)=c("lrt.p.con")
+
+# create data frame with design:
+## done above
+
+# load packages needed:
+library(lme4)
+# Loading required package: Matrix
+library(kyotil) # we want to store info about convergence issues
+
+# define control structure to make convergence more likely:
+contr <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 10000))
+
+xdata <- start.data
+
+
+# run simulation
+for (i in 1:nrow(all.res)) {
+
+  set.seed(i) # allows to later replicate individual simulations
+
+  # add age  (if it should be generated in each loop)
+  age <- sample(x = age_range, size = length(unique(xdata$subj.id)), replace = T)
+  xdata$age <- as.numeric(age[as.numeric(xdata$subj.id)])
+  xdata$z.age <- scale(xdata$age)
+  m.mat <- model.matrix(object = ~condition + z.age + sex + z.trial , data = xdata) # create model martix
+
+  coefs <- c(
+  "(Intercept)" = log(all.res[i, "con.per"] / (1 - all.res[i, "con.per"])),
+  "conditiontest" = log(all.res[i, "test.per"] / (1 - all.res[i, "test.per"] )) - log(all.res[i, "con.per"] / (1 - all.res[i, "con.per"])),
+  "z.age" = 0,
+  "sexm" = 0,
+  "z.trial" = 0
+)
+  
+  LP <- m.mat[, names(coefs)] %*% coefs # LP wrt fixed effects
+
+  # add random effect to linear predictor:
+  LP <- LP + rnorm(n = n.subject, sd = all.res[i, "r.effect"])[as.numeric(xdata$subj.id)] +
+    rnorm(n = n.subject, sd = all.res[i, "r.slope.trial"])[as.numeric(xdata$subj.id)] * xdata$z.trial 
+
+  # generate response:
+  xdata$correct <- rbinom(n = nrow(xdata), size = 1, prob = exp(LP) / (1 + exp(LP)))
+
+  # fit full model:
+  full <- keepWarnings(glmer(correct ~ condition + z.age + sex + z.trial + (1 +  z.trial|| subj.id),
+    data = xdata, family = binomial, control = contr
+  ))
+  # fit null model:
+  null <- keepWarnings(glmer(correct ~ z.age + sex + z.trial  + (1 + z.trial|| subj.id),
+    data = xdata, family = binomial, control = contr
+  ))
+
+  # store results:
+  all.res[i, c("icpt", "conditiontest",  "z.age", "sexm", "z.trial")] <- fixef(full$value)
+  all.res[i, "re.sd"] <- as.data.frame(summary(full$value)$varcor)[1, "sdcor"]
+  all.res[i, "warns.full"] <- nchar(paste(full$warnings, collapse = ""))
+  all.res[i, "warns.null"] <- nchar(paste(null$warnings, collapse = ""))
+  all.res[i, "lrt.p.con"] <- as.data.frame(drop1(full$value, test = "Chisq"))["condition", "Pr(Chi)"]
+  all.res[i, "full.null.p"] <- as.data.frame(anova(null$value, full$value, test = "Chisq"))[2, "Pr(>Chisq)"]
+  all.res[i, "conditiontest.p"] <- as.data.frame(summary(full$value)$coef)["conditiontest", "Pr(>|z|)"]
+
+  print(i)
+}
+
+summary(full$value)
+save.image("power_sim_study6_N80.RData")
+```
+
+## Evaluation of results 
+
+* number of warning per combinations of random effects (out of 1000 models per cell)  
+Full model:  
+```{r echo=FALSE}
+#full model
+tapply(X=all.res[, "warns.full"]>0, INDEX=all.res[, c("test.per")],
+FUN=sum)
+#warning codes: 
+#363: unable to evaluate scaled gradient. Model failed to converge: degenerate  Hessian with 1 negative eigenvalues
+#205: Model is nearly unidentifiable: large eigenvalue ratio - Rescale variables?
+```
+
+Null model:  
+```{r echo=FALSE}
+#null model: 
+tapply(X=all.res[, "warns.null"]>0, INDEX=all.res[, c("test.per")],
+FUN=sum)
+```
+
+* plotting the estimates (all models)
+
+```{r echo=FALSE}
+par(mar=c(3, 3, 0.2, 0.2), mgp=c(1.7, 0.3, 0), tcl=-0.15, las=1)
+plot(
+  x = as.numeric(as.factor(rep(
+    x = c("icpt", "conditiontest"),
+    each = nrow(all.res)
+  ))),
+  y = unlist(all.res[, c("icpt", "conditiontest")]),
+  pch = 19, col = grey(level = 0.2, alpha = 0.2),
+  xaxt = "n", xlim = c(0.5, 2.5), ylab = "estimate", xlab = ""
+)
+mtext(text = c("icpt", "conditiontest"), side = 1, at = 1:3, line = 0.2)
+```
+```{r}
+xdata_agg<-xdata%>%
+  group_by(condition)%>%
+  summarise(correct=mean(correct))
+
+ggplot(xdata_agg, aes(x=condition, y=correct))+
+  geom_boxplot()
+```
+
+## Only models that converged are evaluated from here on:  
+
+```{r include=FALSE}
+all.res2=subset(all.res, warns.full==0)
+
+
+```
+
+
+### How many models converged, have a significant full-null model comparison, and a significant LRT of condition?  
+```{r echo=FALSE}
+
+lrt.data2 <- all.res2 %>%
+  filter(full.null.p<0.05)%>%
+  group_by(con.per, test.per,  r.effect) %>%
+  summarise(condition_test=mean(conditiontest),
+            z.age=mean(z.age),
+            sex=mean(sexm),
+            z.trial=mean(z.trial),
+            lrt.p.con.mean2 = mean(lrt.p.con), 
+            n.sign.lrt2 = length(lrt.p.con[lrt.p.con < 0.05]), 
+            n.lrt = n.simus,#length(lrt.p.con), 
+            proportion.sign.lrt2 = length(lrt.p.con[lrt.p.con < 0.05]) / n.simus,
+            conditiontest.p.sign.prop = length(conditiontest.p[conditiontest.p < 0.05]) / n.simus)
+
+lrt.data2
+```
